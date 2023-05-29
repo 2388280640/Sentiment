@@ -22,6 +22,8 @@ from keras import optimizers
 import tensorflow as tf
 import json
 from keras.callbacks import EarlyStopping #提前停止训练
+from keras import regularizers #引入正则项
+from keras.layers import MultiHeadAttention
 #https://blog.csdn.net/yjw123456/article/details/120232707
 class LayerPlus(Layer):
     def get_config(self):
@@ -163,6 +165,44 @@ class MultiAttention(LayerPlus):
     def compute_output_shape(self, input_shape):
         return (input_shape[0],input_shape[1],self.out_dim)
 
+from tensorflow import keras
+from tensorflow.keras import layers
+class TransformerEncoder(layers.Layer):
+    def __init__(self, embed_dim, dense_dim, num_heads, **kwargs):
+        super().__init__(**kwargs)
+        # embedding 维度
+        self.embed_dim = embed_dim
+        # 全连接层维度
+        self.dense_dim = dense_dim
+        # 要几个投
+        self.num_heads = num_heads
+        self.attention = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=embed_dim)
+        self.dense_proj = keras.Sequential(
+            [layers.Dense(dense_dim, activation="relu"),
+             layers.Dense(embed_dim),]
+        )
+        self.layernorm_1 = layers.LayerNormalization()
+        self.layernorm_2 = layers.LayerNormalization()
+    def call(self, inputs, mask=None):
+        if mask is not None:
+            mask = mask[:, tf.newaxis, :]
+        attention_output = self.attention(
+            inputs, inputs, attention_mask=mask)
+        proj_input = self.layernorm_1(inputs + attention_output)
+        proj_output = self.dense_proj(proj_input)
+        return self.layernorm_2(proj_input + proj_output)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "embed_dim": self.embed_dim,
+            "num_heads": self.num_heads,
+            "dense_dim": self.dense_dim,
+        })
+        return config
+
+
 def ConverToNumpy(tensor):
     with tf.compat.v1.Session() as sess:
         sess.run(tf.compat.v1.global_variables_initializer())
@@ -171,25 +211,36 @@ def ConverToNumpy(tensor):
 def PreProcessWithBert(data):
     bert_model = TFBertModel.from_pretrained('./bert-base-uncased')
     tokenizer = BertTokenizer.from_pretrained('./bert-base-uncased')
-    bertOutput1 = None
-    bertOutput2 = None
-    token = tokenizer(data[:7000],return_tensors='tf',max_length=50,padding='max_length',truncation=True,add_special_tokens=True)
-
-    output = bert_model(token)
-    with tf.compat.v1.Session() as sess:
-        sess.run(tf.compat.v1.global_variables_initializer())
-        bertOutput1 = sess.run(output['last_hidden_state'])
-    token = tokenizer(data[7000:], return_tensors='tf', max_length=50, padding='max_length', truncation=True,
-                      add_special_tokens=True)
-
-    output = bert_model(token)
-    with tf.compat.v1.Session() as sess:
-        sess.run(tf.compat.v1.global_variables_initializer())
-        bertOutput2 =sess.run(output['last_hidden_state'])
-
-    pretrained_data = np.concatenate((bertOutput1,bertOutput2),axis=0)
-    np.save('text_data_pretrained.npy',pretrained_data)
-    return output
+    bertOutput = None
+    batch=0
+    for i in range(len(data)):
+        if i % 1000==0:
+            batch = batch +1
+            print("batch:",batch)
+    for i in range(batch):
+        if (i+1)*1000 < len(data):
+            print("i:",i)
+            token = tokenizer(data[i*1000:(i+1)*1000],return_tensors='tf',max_length=100,padding='max_length',truncation=True,add_special_tokens=True)
+            output = bert_model(token)
+            with tf.compat.v1.Session() as sess:
+                sess.run(tf.compat.v1.global_variables_initializer())
+                tmp = sess.run(output['last_hidden_state'])
+                if i ==0:
+                    bertOutput = tmp
+                else:
+                    bertOutput=np.concatenate((bertOutput,tmp),axis=0)
+        else:
+            token = tokenizer(data[i*1000:],return_tensors='tf',max_length=100,padding='max_length',truncation=True,add_special_tokens=True)
+            output = bert_model(token)
+            with tf.compat.v1.Session() as sess:
+                sess.run(tf.compat.v1.global_variables_initializer())
+                tmp=sess.run(output['last_hidden_state'])
+                if i ==0:
+                    bertOutput = tmp
+                else:
+                    bertOutput=np.concatenate((bertOutput,tmp),axis=0)
+    np.save('text_data_pretrained.npy',bertOutput)
+    return bertOutput
 
 def createModel(train_data):
     
@@ -210,43 +261,47 @@ def createModel(train_data):
     model.summary()
     return model
     '''
+    #验证集震荡很严重,去掉卷积层
     inputLayer = Input(shape=(train_data.shape[1], train_data.shape[2]))
-    batchNormalization = BatchNormalization()(inputLayer)
-    dense1 = Dense(units=64, activation='relu')(batchNormalization)
-    dropout1 = Dropout(0.3)(dense1)
-    dense2 = Dense(units=128,activation='relu')(dropout1)
-    dropout2 = Dropout(0.3)(dense2)
-    pool1 = AveragePooling1D(pool_size=5,strides=None,padding='valid')(dropout2)
-    fla = Flatten()(pool1)
-    OutputLayer = Dense(units=3, activation='softmax')(fla)
+    lay = TransformerEncoder(train_data.shape[2],128,32)(inputLayer)#best 128
+    lay = BatchNormalization()(lay)
+    lay = Dropout(0.3)(lay)
+    lay = Dense(units=64,activation='relu',kernel_regularizer=regularizers.l2(0.01))(lay)#最好64
+    #lay = Conv1D(32,5,padding='same',activation='relu',kernel_regularizer = regularizers.l2(0.01))(lay)
+    #lay = AveragePooling1D(pool_size=5,strides=None,padding='valid')(lay)
+    lay = BatchNormalization()(lay)
+    lay = Dropout(0.3)(lay)
+    lay = Flatten()(lay)
+    OutputLayer = Dense(units=3, activation='softmax')(lay)
     model = Model(inputs=inputLayer, outputs=OutputLayer)
-    sgd = optimizers.gradient_descent_v2.SGD(learning_rate=0.01)
-    #adam = optimizers.adam_v2.Adam(learning_rate=0.001)
+    sgd = optimizers.gradient_descent_v2.SGD(learning_rate=0.001)
+    #adam = optimizers.adam_v2.Adam(learning_rate=0.0001)
     model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
     model.summary()
     return model
 
 import matplotlib.pyplot as plt
-def show_train_history(history,train,validation):
+def show_train_history(history,train,validation,name):
     plt.plot(history.history[train])
     plt.plot(history.history[validation])
     plt.title('Train_History')
     plt.xlabel('Epoch')
     plt.ylabel(train)
     plt.legend(['train','validation'],loc='upper left')
-    plt.show()
+    plt.savefig(name)
+    plt.close()
 
-#最好的效果参数epochs=200,
+
 
 def TrainModel(model,train_data,train_label,test_data,test_label):
-    earlyStop = EarlyStopping(monitor='val_accuracy',min_delta=0,patience=100,mode='max',verbose=1,restore_best_weights=True)
-    histoty=model.fit(
+    earlyStop = EarlyStopping(monitor='val_accuracy',min_delta=0,patience=50,mode='max',verbose=1,restore_best_weights=True)
+    history=model.fit(
         x=train_data,
         y=train_label,
-        batch_size=120,
+        batch_size=128,
         callbacks=[earlyStop],
-        epochs=500,
-        validation_split=0.2,
+        epochs=600,
+        validation_split=0.3,
         verbose=1,
         shuffle=True
     )
@@ -254,7 +309,10 @@ def TrainModel(model,train_data,train_label,test_data,test_label):
     score= model.evaluate(x=test_data,y=test_label)
     print(score[1])
     with open('BertRestNet50FineTune.json','w') as f:
-        json.dump(histoty.history,f)
+        json.dump(history.history,f)
+    show_train_history(history,'accuracy','val_accuracy','Classifer_accuracy.png')
+    show_train_history(history,'loss','val_loss','Classifer_loss.png')
+
 
 def TestModel(model,test_data,test_label):
     score = model.evaluate(x=test_data,y=test_label)
@@ -291,6 +349,8 @@ def TrainBiLSTMModel(model,train_data,train_label,test_data,test_label):
     model.save_weights('BiLSTM.h5')
     score = model.evaluate(x=test_data,y=test_label)
     print("BiLSTM accuracy:",score[1])
+    show_train_history(history,'accuracy','val_accuracy','BiLSTM_accuracy.png')
+    show_train_history(history,'loss','val_loss','BiLSTM_loss.png')
     return model
 
 
@@ -345,7 +405,7 @@ def readfile(path):
                 if canRead==True:
                     with open(dataPath + '/' + content[0] + '.txt', 'r', encoding='utf-8') as t:
                         line = t.readline()
-                        re_tag = re.compile(r'(#\S+)|(\s{2,})|(@)')
+                        re_tag = re.compile(r'(#\S+)|(\s{2,})|(@)|((http|ftp|https):\/\/[\w\-_]+(\.[\w\-_]+)+([\w\-\.,@?^=%&:/~\+#]*[\w\-\@?^=%&/~\+#])?)')
                         re_tag.sub('',line)
                         text_data = text_data + [line]
                     image_path = image_path + [dataPath + '/' + content[0] + '.jpg']
@@ -385,18 +445,29 @@ def RestNetFineTune(image_path,label):
     #imagenet
     rest50 = ResNet50(weights='imagenet',include_top=True,input_shape=(224,224,3))
     x=rest50.layers[-1].input
-    outputLayer = Dense(units=3,activation='softmax')(x)
+    dense1 = Dense(2048,activation='relu',kernel_regularizer=regularizers.l2(0.01))(x)
+    dropout1 = Dropout(0.4)(dense1)
+    batch1 = BatchNormalization()(dropout1)
+    dense2 = Dense(1024,activation='relu',kernel_regularizer=regularizers.l2(0.01))(batch1)
+    dropout2 = Dropout(0.4)(dense2)
+    batch2 = BatchNormalization()(dropout2)
+    outputLayer = Dense(units=3,activation='softmax')(batch2)
     model=Model(inputs=rest50.input,outputs=outputLayer)
     #print(len(model.layers))
+    model.summary()
     mid = int(len(model.layers)*80/100)
     for i in range(mid):
         model.layers[i].trainable=False
     sgd = optimizers.gradient_descent_v2.SGD(learning_rate=0.001)
     model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
-    model.fit(x=train_data,y=train_label,validation_split=0.5,batch_size=120,epochs=50,verbose=1)
+    earlyStop = EarlyStopping(monitor='val_accuracy',min_delta=0,patience=5,mode='max',verbose=10,restore_best_weights=True)
+    history=model.fit(x=train_data,y=train_label,validation_split=0.2,batch_size=120,epochs=50,verbose=1,callbacks=[earlyStop])
     scores=model.evaluate(x=test_data,y=test_label)
     print(scores[1])
     model.save_weights('RestNet50.h5')
+    show_train_history(history,'accuracy','val_accuracy','ResNet_accuracy.png')
+    show_train_history(history,'loss','val_loss','ResNet_loss.png')
+
     return model
 
 def VGG19FineTune(image_path,label):
@@ -451,7 +522,7 @@ def PreprocessImage(model,pathList):
         x = np.expand_dims(x, axis=0)
         x = preprocess_input(x)
         feature = model.predict(x)
-        feature = np.resize(feature, (50, 41))  # 原本尺寸为2048=2048,改变形状为50X41=2050
+        feature = np.resize(feature, (100, 41))  # 原本尺寸为2048=2048,改变形状为50X41=2050
         picFeatureList=picFeatureList+[feature]
     return np.array(picFeatureList)
 
@@ -465,8 +536,14 @@ def ProjectRun():
             model = RestNetFineTune(image_path.copy(),label.copy())
         else:
             rest = ResNet50(weights='imagenet', include_top=True, input_shape=(224, 224, 3))
-            x=rest.layers[-1].input
-            outputLayer = Dense(units=3,activation='softmax')(x)
+            x=rest50.layers[-1].input
+            dense1 = Dense(2048,activation='relu',kernel_regularizer=regularizers.l2(0.01))(x)
+            dropout1 = Dropout(0.4)(dense1)
+            batch1 = BatchNormalization()(dropout1)
+            dense2 = Dense(1024,activation='relu',kernel_regularizer=regularizers.l2(0.01))(batch1)
+            dropout2 = Dropout(0.4)(dense2)
+            batch2 = BatchNormalization()(dropout2)
+            outputLayer = Dense(units=3,activation='softmax')(batch2)
             model=Model(inputs=rest.input,outputs=outputLayer)
             model.load_weights('RestNet50.h5')
         image_pretrained=PreprocessImage(model,image_path)
@@ -506,7 +583,8 @@ def ProjectRun():
     else:
         text_data_extract_BiLSTM=np.load('text_data_extract_BiLSTM.npy')
 
-    concated_data=np.concatenate(( text_data_extract_BiLSTM ,image_pretrained),axis=2)
+    concated_data=np.concatenate(( image_pretrained , text_data_extract_BiLSTM ),axis=2)
+    concated_data=np.concatenate(( concated_data ,image_pretrained),axis=2)
     np.random.seed(999)
     np.random.shuffle(concated_data)
     np.random.seed(999)
@@ -535,4 +613,4 @@ score=model.evaluate(x=test_data[3000:6000],y=test_label[3000:6000])
 print(score[1])
 '''
 #print(tf.test.is_gpu_available())
-#model accuracy:69.68%
+# See PyCharm help at https://www.jetbrains.com/help/pycharm/
